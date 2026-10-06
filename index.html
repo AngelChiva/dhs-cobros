@@ -213,6 +213,16 @@ async function marcarDevuelto(fid,cid,hid){
 const marcarCobrado = (fid,cid)=>{ if(!confirm("¿Marcar este cargo como cobrado por otra vía (transferencia, efectivo…)? Ya no saldrá en pendientes.")) return; return intento(()=>setCargo(fid,cid,c=>({...c,estado:"cobrado",via:"manual",fechaCobro:hoy()}))); };
 const reabrir = (fid,cid)=>{ if(!confirm("¿Volver a poner este cargo como pendiente?")) return; return intento(()=>setCargo(fid,cid,c=>({...c,estado:"pendiente",via:null}))); };
 
+/* Limpieza inicial: dar por cobrado todo lo anterior a una fecha */
+async function limpieza(){
+  const f0=$("#fCorte").value; if(!f0) return aviso("Elige una fecha.",true);
+  const pares=[]; let n=0;
+  facturas().forEach(f=>{ if(!f.fecha||f.fecha>=f0) return; let toca=false; const cargos=(f.cargos||[]).map(c=>{ if(["pendiente","devuelto"].includes(c.estado)){ toca=true; n++; return {...c,estado:"cobrado",via:"manual",fechaCobro:hoy()}; } return c; }); if(toca) pares.push([f.id,{cargos}]); });
+  if(!n) return aviso("No hay cargos pendientes anteriores a esa fecha.");
+  if(!confirm("Se van a marcar como ya cobrados "+n+" cargos de "+pares.length+" facturas anteriores al "+fch(f0)+".\n\nSi alguna no lo está, se puede volver a poner pendiente abriendo la factura. ¿Continuar?")) return;
+  await intento(async()=>{ await guardarVarios(pares); render(); aviso(n+" cargos marcados como ya cobrados."); });
+}
+
 /* ============ Hoja de la semana ============ */
 async function cerrarHoja(){
   const L=lineasEnviar(); if(!L.length) return;
@@ -328,7 +338,7 @@ function estadoChip(c){
   if(c.estado==="devuelto") return '<span class="chip bad">Devuelta'+(d>1?" ×"+d:"")+'</span>';
   if(c.estado==="enviar") return '<span class="chip sel">En la hoja de esta semana</span>';
   if(c.estado==="cargado") return '<span class="chip ok">Cargada '+fch(((c.intentos||[]).slice(-1)[0]||{}).fecha)+'</span>'+(d?' <span class="chip">tras '+d+' devol.</span>':'');
-  return '<span class="chip ok">Cobrada'+(c.via==="contasimple"?" (Contasimple)":c.via==="manual"?" (otra vía)":"")+'</span>';
+  return '<span class="chip ok">Cobrada'+(c.via==="contasimple"?" (Contasimple)":c.via==="manual"?" (marcada a mano)":"")+'</span>';
 }
 function filtroFacturas(){
   const q=norm(UI.q);
@@ -358,7 +368,7 @@ function tarjeta(f){
     ${descuadre(f)?'<div class="meta" style="color:var(--bad)">Los pagos no suman el total de la factura. Revísalo.</div>':""}
     ${cs.some(c=>ABIERTO.includes(c.estado))&&fa.length?`<div style="margin-top:6px">${fa.map(x=>'<span class="chip warn">'+x+'</span>').join(" ")} <button class="btn sm ghost" data-act="cliente" data-id="${f.cli}">Completar</button></div>`:""}
     ${cs.map(c=>{ const et=etiqueta(f,c); return `<div class="cargo"><div class="c1">${cs.length>1||et?`<b class="num">${eur(c.importe)}</b> ${esc(et)} `:""}${estadoChip(c)}</div>
-      ${["pendiente","devuelto"].includes(c.estado)?`<button class="btn sm" data-act="enviar" data-id="${f.id}" data-c="${c.id}">Enviar a cobrar</button>`:""}
+      ${["pendiente","devuelto"].includes(c.estado)?`<button class="btn sm" data-act="enviar" data-id="${f.id}" data-c="${c.id}">Enviar a cobrar</button><button class="btn sm ghost" data-act="yaCobrada" data-id="${f.id}" data-c="${c.id}">Ya cobrada</button>`:""}
       ${c.estado==="enviar"?`<button class="btn sm ghost" data-act="quitar" data-id="${f.id}" data-c="${c.id}">Quitar de la hoja</button>`:""}</div>`; }).join("")}
   </div>`;
 }
@@ -421,6 +431,9 @@ function vAjustes(){
   <div class="panel"><h3>Administradores de fincas</h3><p class="sub" style="margin:0">La lista de la que se elige en cada comunidad.</p>
     <ul class="list">${admins().map(a=>`<li><div class="nm"><b>${esc(a)}</b><span>${clientes().filter(x=>x.admin===a).length} comunidades</span></div><button class="btn sm danger" data-act="delAdmin" data-v="${esc(a)}">Quitar</button></li>`).join("")||'<li class="sub">Aún no hay ninguno.</li>'}</ul>
     <div class="row" style="margin-top:10px"><input type="text" id="nAdmin" placeholder="Nombre del administrador" style="flex:1;min-width:180px"><button class="btn" data-act="addAdmin">Añadir</button></div></div>
+  <div class="panel"><h3>Limpieza inicial</h3><p class="sub" style="margin:0 0 4px">Da por cobradas de una vez todas las facturas anteriores a una fecha. Las sueltas se marcan con el botón «Ya cobrada» de cada factura.</p>
+    <label for="fCorte">Marcar como ya cobradas las anteriores al</label><input type="date" id="fCorte">
+    <div class="row" style="margin-top:12px"><button class="btn ghost" data-act="limpieza">Marcar como ya cobradas</button></div></div>
   <div class="panel"><h3>Factura a mano</h3><p class="sub" style="margin:0 0 8px">Para una factura que no venga de Contasimple.</p><button class="btn ghost" data-act="nuevaFactura">Añadir factura</button></div>`;
 }
 
@@ -432,7 +445,7 @@ function render(){
   nav.innerHTML=TABS.map(([k,t])=>`<button data-act="tab" data-v="${k}" aria-current="${UI.tab===k}">${t}${k==="hoja"&&n?"<i>"+n+"</i>":""}</button>`).join("");
   const foco=document.activeElement&&document.activeElement.id;
   if(UI.tab==="pend"&&foco==="q"&&$("#lista")){ $("#lista").innerHTML=listaHTML(); return; }
-  if(UI.tab==="aj"&&["csKey","nAdmin","desde"].includes(foco)) return;
+  if(UI.tab==="aj"&&["csKey","nAdmin","desde","fCorte"].includes(foco)) return;
   const v={pend:vPend,hoja:vHoja,hist:vHist,cli:vCli,aj:vAjustes}[UI.tab]();
   $("#app").innerHTML=(UI.demo?'<div class="banner">Modo de prueba: datos inventados, nada se guarda.</div>':"")+(!UI.demo&&!cfg().csKey&&UI.tab!=="aj"?'<div class="banner">Falta conectar Contasimple. Hazlo en «Ajustes».</div>':"")+v;
 }
@@ -515,6 +528,8 @@ document.addEventListener("click",async ev=>{
     case "salir": if(!UI.demo) firebase.auth().signOut(); break;
     case "cerrar": cerrar(); break;
     case "enviar": await enviarACobrar(d.id,d.c); break;
+    case "yaCobrada": await intento(async()=>{ await setCargo(d.id,d.c,c=>({...c,estado:"cobrado",via:"manual",fechaCobro:hoy()})); aviso("Marcada como ya cobrada. Para deshacerlo, abre la factura."); }); break;
+    case "limpieza": await limpieza(); break;
     case "quitar": await quitarDeHoja(d.id,d.c); break;
     case "factura": abrirFactura(d.id); break;
     case "cliente": abrirCliente(d.id); break;
