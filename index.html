@@ -99,6 +99,10 @@ table.t td{border-bottom:1px solid var(--line);padding:8px 6px;vertical-align:to
 table.t td.r,table.t th.r{text-align:right}
 .scroll{overflow-x:auto}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;letter-spacing:.2px}
+.selAdmin{width:auto;max-width:100%;min-height:36px;padding:5px 8px;font-size:13.5px}
+.list li.cli{flex-wrap:wrap}
+.list li.cli .nm{flex:1 1 190px}
+.list li.cli .selAdmin{flex:1 1 170px;max-width:270px}
 table.t td.mono{white-space:nowrap}
 table.t{min-width:560px}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
@@ -135,7 +139,7 @@ const CS_API = "https://api.contasimple.com/api/v2";
 /* ============ Estado ============ */
 const S = {docs:{}};
 const UI = {demo:new URLSearchParams(location.search).has("demo"), user:null, ready:false, tab:"pend",
-            q:"", fAdmin:"", fEstado:"abiertas", hojaLista:null, sincronizando:false};
+            q:"", fAdmin:"", fEstado:"abiertas", fCli:"sinadmin", qCli:"", hojaLista:null, sincronizando:false};
 let fdb=null;
 const $ = s=>document.querySelector(s);
 const esc = s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -179,6 +183,13 @@ function etiqueta(f,c){ if(c.concepto) return c.concepto; const b=baseDe(f); ret
 const pendienteDe = f=>r2((f.cargos||[]).filter(c=>ABIERTO.includes(c.estado)).reduce((s,c)=>s+c.importe,0));
 const descuadre = f=>Math.abs(r2(baseDe(f).reduce((s,c)=>s+c.importe,0))-r2(f.total))>0.005;
 const nDev = c=>(c.intentos||[]).filter(i=>i.res==="devuelto").length;
+/* Cobrada en la app pero todavía pendiente en Contasimple (la app no escribe en Contasimple: solo avisa) */
+const fechaCobroDe = c=>c.estado==="cargado" ? (((c.intentos||[]).slice(-1)[0]||{}).fecha||"") : (c.fechaCobro||"");
+const diasDesde = s=>s?Math.floor((Date.now()-new Date(s+"T00:00:00"))/864e5):0;
+function faltaCS(f){
+  if(f.origen!=="cs"||f.statusCS==="Payed") return false; const cs=f.cargos||[]; if(!cs.length) return false;
+  return cs.every(c=>c.estado==="cobrado"||(c.estado==="cargado"&&diasDesde(fechaCobroDe(c))>=7));
+}
 function lineasEnviar(){ const L=[]; facturas().forEach(f=>(f.cargos||[]).forEach(c=>{ if(c.estado==="enviar") L.push({f,c,cli:cliDe(f)}); })); return L.sort((a,b)=>(a.cli.nombre||"").localeCompare(b.cli.nombre||"","es")); }
 
 /* ============ Datos: escritura ============ */
@@ -212,6 +223,20 @@ async function marcarDevuelto(fid,cid,hid){
 }
 const marcarCobrado = (fid,cid)=>{ if(!confirm("¿Marcar este cargo como cobrado por otra vía (transferencia, efectivo…)? Ya no saldrá en pendientes.")) return; return intento(()=>setCargo(fid,cid,c=>({...c,estado:"cobrado",via:"manual",fechaCobro:hoy()}))); };
 const reabrir = (fid,cid)=>{ if(!confirm("¿Volver a poner este cargo como pendiente?")) return; return intento(()=>setCargo(fid,cid,c=>({...c,estado:"pendiente",via:null}))); };
+
+/* Copia de seguridad: todo menos la clave de Contasimple */
+function copiaSeguridad(){
+  const docs={}; Object.entries(S.docs).forEach(([id,d])=>{ const x={...d}; if(id==="config") delete x.csKey; docs[id]=x; });
+  const f=new File([JSON.stringify({app:"dhs-cobros",fecha:new Date().toISOString(),docs},null,1)],"dhs-cobros-copia-"+hoy()+".json",{type:"application/json"});
+  descargar(f); intento(()=>guardar("config",{tipo:"config",ultimaCopia:Date.now()})); aviso("Copia descargada. Guárdala en la carpeta de DHS.");
+}
+async function restaurarCopia(file){
+  let j; try{ j=JSON.parse(await file.text()); }catch(e){ return aviso("El archivo no es una copia válida.",true); }
+  if(!j||j.app!=="dhs-cobros"||!j.docs) return aviso("El archivo no es una copia de esta app.",true);
+  const pares=Object.entries(j.docs).filter(([id,d])=>d&&d.tipo).map(([id,d])=>{ const x={...d}; delete x.csKey; return [id,x]; });
+  if(!confirm("Se van a restaurar "+pares.length+" registros de la copia del "+fch(String(j.fecha).slice(0,10))+".\n\nLo que haya cambiado desde entonces en esos registros se perderá. ¿Continuar?")) return;
+  await intento(async()=>{ await guardarVarios(pares); render(); aviso("Copia restaurada."); });
+}
 
 /* Limpieza inicial: dar por cobrado todo lo anterior a una fecha */
 async function limpieza(){
@@ -293,7 +318,7 @@ async function sincronizar(manual){
     const c=cfg(), desde=c.lastSync ? new Date(c.lastSync-48*3600*1000) : new Date((c.desde||new Date().getFullYear()+"-01-01")+"T00:00:00");
     const inicio=Date.now(); let todas=[], i=0;
     for(;;){ const j=await csGet("/accounting/invoices/issued/from?date="+encodeURIComponent(desde.toISOString())+"&startIndex="+i+"&numRows=100"); const d=(j&&j.data)||[]; todas=todas.concat(d); if(d.length<100||todas.length>5000) break; i+=100; }
-    const pares=[], cliNuevos={}; let nuevas=0, actual=0, pagadas=0, rect=0;
+    const pares=[], cliNuevos={}; let nuevas=0, actual=0, pagadas=0, rect=0, sacadas=0;
     for(const inv of todas){
       if(inv.isRectificationInvoice){ rect++; continue; }
       const t=inv.target||{}, cid=claveCli(t.nif,t.id,t.organization), fid="f_"+inv.id, ya=S.docs[fid];
@@ -304,7 +329,7 @@ async function sincronizar(manual){
         actual++; let cargos=(ya.cargos||[]).slice(), toca=false;
         const b=cargos.filter(x=>!x.extra);
         if(b.length===1 && b[0].estado==="pendiente" && !(b[0].intentos||[]).length && r2(b[0].importe)!==total){ cargos=cargos.map(x=>x.id===b[0].id?{...x,importe:total}:x); toca=true; }
-        if(pagada && ya.statusCS!=="Payed"){ cargos=cargos.map(x=>["pendiente","devuelto"].includes(x.estado)?{...x,estado:"cobrado",via:"contasimple",fechaCobro:hoy()}:x); toca=true; }
+        if(pagada && ya.statusCS!=="Payed"){ if(cargos.some(x=>x.estado==="enviar")) sacadas++; cargos=cargos.map(x=>["pendiente","devuelto","enviar"].includes(x.estado)?{...x,estado:"cobrado",via:"contasimple",fechaCobro:hoy(),prev:null}:x); toca=true; }
         if(toca) base.cargos=cargos;
       }
       pares.push([fid,base]);
@@ -323,6 +348,7 @@ async function sincronizar(manual){
     pares.push(["config",{tipo:"config",lastSync:inicio}]);
     await guardarVarios(pares);
     if(manual||nuevas) aviso(nuevas?(nuevas+" facturas nuevas"+(pagadas?" ("+pagadas+" ya pagadas en Contasimple)":"")+(conIban?" · "+conIban+" cuentas encontradas":"")+(rect?" · "+rect+" rectificativas sin importar":"")):"Sin facturas nuevas. Todo al día.");
+    if(sacadas) aviso(sacadas+(sacadas===1?" factura estaba":" facturas estaban")+" en la hoja de la semana y Contasimple ya la"+(sacadas===1?"":"s")+" da por pagada"+(sacadas===1?"":"s")+": se ha"+(sacadas===1?"":"n")+" quitado de la hoja.",true);
     UI.errSync=null;
   }catch(e){
     console.error(e); UI.errSync=e.red?"red":(e.message||String(e));
@@ -354,6 +380,7 @@ function filtroFacturas(){
       case "hoja": return cs.some(c=>c.estado==="enviar");
       case "cargadas": return cs.some(c=>c.estado==="cargado");
       case "cobradas": return cs.length>0 && cs.every(c=>c.estado==="cobrado");
+      case "cs": return faltaCS(f);
       default: return true;
     }
   }).sort((a,b)=>(a.fecha||"").localeCompare(b.fecha||"")||String(a.numero).localeCompare(String(b.numero)));
@@ -366,20 +393,27 @@ function tarjeta(f){
     <span class="meta">Factura ${esc(f.numero||"s/n")} · ${fch(f.fecha)}${cs.some(c=>ABIERTO.includes(c.estado))&&dias>30?" · hace "+dias+" días":""} · ${cli.admin?esc(cli.admin):"<em>sin administrador</em>"}</span></button>
     <span class="num">${eur(f.total)}</span></div>
     ${descuadre(f)?'<div class="meta" style="color:var(--bad)">Los pagos no suman el total de la factura. Revísalo.</div>':""}
-    ${cs.some(c=>ABIERTO.includes(c.estado))&&fa.length?`<div style="margin-top:6px">${fa.map(x=>'<span class="chip warn">'+x+'</span>').join(" ")} <button class="btn sm ghost" data-act="cliente" data-id="${f.cli}">Completar</button></div>`:""}
+    ${cs.some(c=>ABIERTO.includes(c.estado))&&fa.length?`<div style="margin-top:6px">${fa.map(x=>'<span class="chip warn">'+x+'</span>').join(" ")} ${!cli.admin&&S.docs[f.cli]?selAdmin({id:f.cli,...cli}):""} <button class="btn sm ghost" data-act="cliente" data-id="${f.cli}">Completar</button></div>`:""}
     ${cs.map(c=>{ const et=etiqueta(f,c); return `<div class="cargo"><div class="c1">${cs.length>1||et?`<b class="num">${eur(c.importe)}</b> ${esc(et)} `:""}${estadoChip(c)}</div>
       ${["pendiente","devuelto"].includes(c.estado)?`<button class="btn sm" data-act="enviar" data-id="${f.id}" data-c="${c.id}">Enviar a cobrar</button><button class="btn sm ghost" data-act="yaCobrada" data-id="${f.id}" data-c="${c.id}">Ya cobrada</button>`:""}
       ${c.estado==="enviar"?`<button class="btn sm ghost" data-act="quitar" data-id="${f.id}" data-c="${c.id}">Quitar de la hoja</button>`:""}</div>`; }).join("")}
   </div>`;
 }
-function listaHTML(){ const L=filtroFacturas(); if(!L.length) return '<div class="panel empty">No hay facturas con este filtro.</div>'; const t=r2(L.reduce((s,f)=>s+pendienteDe(f),0)); return `<p class="sub">${L.length} facturas${t?" · pendiente de cobro: <b>"+eur(t)+"</b>":""}</p>`+L.map(tarjeta).join(""); }
+function listaHTML(){ const L=filtroFacturas();
+  if(UI.fEstado==="cs"){
+    if(!L.length) return '<div class="panel empty">Todo cuadra: no hay ninguna factura cobrada aquí que siga pendiente en Contasimple.</div>';
+    return `<div class="panel"><h3>Falta marcar como pagadas en Contasimple</h3><p class="sub" style="margin:0 0 8px">${L.length} ${L.length===1?"factura está cobrada":"facturas están cobradas"} en esta app y en Contasimple ${L.length===1?"sigue":"siguen"} como pendiente${L.length===1?"":"s"}. Márcalas allí como pagadas; al actualizar, desaparecen de esta lista. Las cargadas en el banco salen aquí a los 7 días, por si las devuelven.</p>
+    <div class="scroll"><table class="t"><tr><th>Nº factura</th><th>Comunidad</th><th class="r">Importe</th><th>Cobrada</th></tr>${L.map(f=>{ const fs=(f.cargos||[]).map(fechaCobroDe).filter(Boolean).sort(); return `<tr><td><b>${esc(f.numero)}</b><br><span class="sub">${fch(f.fecha)}</span></td><td>${esc(cliDe(f).nombre||f.cliNombre)}</td><td class="r num">${eur(f.total)}</td><td>${fs.length?fch(fs[fs.length-1]):"—"}<br><span class="sub">${(f.cargos||[]).some(c=>c.estado==="cargado")?"cargo en banco":"marcada a mano"}</span></td></tr>`; }).join("")}</table></div></div>`;
+  }
+  if(!L.length) return '<div class="panel empty">No hay facturas con este filtro.</div>'; const t=r2(L.reduce((s,f)=>s+pendienteDe(f),0)); return `<p class="sub">${L.length} facturas${t?" · pendiente de cobro: <b>"+eur(t)+"</b>":""}</p>`+L.map(tarjeta).join(""); }
 function vPend(){
   const F=facturas(), ab=F.filter(f=>(f.cargos||[]).some(c=>ABIERTO.includes(c.estado)));
   const tot=r2(ab.reduce((s,f)=>s+pendienteDe(f),0)), dev=F.filter(f=>(f.cargos||[]).some(c=>c.estado==="devuelto")).length, fal=ab.filter(f=>faltas(cliDe(f)).length).length, enH=lineasEnviar();
   const k=(e,t,v)=>`<button class="panel ${UI.fEstado===e?"on":""}" data-act="festado" data-v="${e}"><span>${t}</span><b>${v}</b></button>`;
   const porA={}; ab.forEach(f=>{ const a=cliDe(f).admin||"__sin"; porA[a]=r2((porA[a]||0)+pendienteDe(f)); });
-  const est=[["abiertas","Pendientes de cobro"],["devueltas","Devueltas"],["falta","Les falta algo"],["hoja","En la hoja de esta semana"],["cargadas","Cargadas"],["cobradas","Cobradas"],["todas","Todas"]];
-  return `<div class="kpis">${k("abiertas","Pendiente de cobro",eur(tot))}${k("devueltas","Devueltas",dev)}${k("falta","Les falta algo",fal)}${k("hoja","En la hoja",enH.length)}</div>
+  const est=[["abiertas","Pendientes de cobro"],["devueltas","Devueltas"],["falta","Les falta algo"],["hoja","En la hoja de esta semana"],["cargadas","Cargadas"],["cobradas","Cobradas"],["cs","Falta marcar en Contasimple"],["todas","Todas"]];
+  const nCS=F.filter(faltaCS).length;
+  return (nCS&&UI.fEstado!=="cs"?`<div class="banner"><b>${nCS} ${nCS===1?"factura cobrada sigue":"facturas cobradas siguen"} pendiente${nCS===1?"":"s"} en Contasimple.</b> <button class="btn sm" data-act="festado" data-v="cs" style="margin-left:6px">Ver cuáles</button></div>`:"")+`<div class="kpis">${k("abiertas","Pendiente de cobro",eur(tot))}${k("devueltas","Devueltas",dev)}${k("falta","Les falta algo",fal)}${k("hoja","En la hoja",enH.length)}</div>
   <div class="filters"><input type="search" id="q" placeholder="Buscar comunidad, nº de factura…" value="${esc(UI.q)}">
     <select id="fAdmin"><option value="">Todos los administradores</option>${admins().map(a=>`<option ${UI.fAdmin===a?"selected":""} value="${esc(a)}">${esc(a)}${porA[a]?" · "+eur(porA[a]):""}</option>`).join("")}<option value="__sin" ${UI.fAdmin==="__sin"?"selected":""}>Sin administrador${porA.__sin?" · "+eur(porA.__sin):""}</option></select>
     <select id="fEstado">${est.map(([v,t])=>`<option value="${v}" ${UI.fEstado===v?"selected":""}>${t}</option>`).join("")}</select></div>
@@ -413,11 +447,27 @@ function vHist(){
   return H.map(h=>{ const dv=h.lineas.filter(l=>l.dev).length; return `<div class="panel"><h3>Hoja del ${fch(h.fecha)}</h3><p class="sub" style="margin:0 0 8px">${h.lineas.length} cargos · <b>${eur(h.total)}</b>${dv?' · <span class="chip bad">'+dv+(dv===1?' devuelta':' devueltas')+'</span>':""}</p>
     ${tablaLineas(h.lineas,h.id)}<div class="row" style="margin-top:10px"><button class="btn sm ghost" data-act="bajar" data-id="${h.id}" data-c="pdf">PDF</button><button class="btn sm ghost" data-act="bajar" data-id="${h.id}" data-c="xlsx">Excel</button><button class="btn sm ghost" data-act="verEnvio" data-id="${h.id}">Enviar</button></div></div>`; }).join("");
 }
+function selAdmin(c){ return `<select class="selAdmin" data-id="${c.id}" aria-label="Administrador de ${esc(c.nombre)}"><option value="">${c.admin?"— Quitar administrador —":"Elegir administrador…"}</option>${admins().map(a=>`<option ${c.admin===a?"selected":""}>${esc(a)}</option>`).join("")}<option value="__nuevo">+ Nuevo administrador…</option></select>`; }
+function listaCliHTML(){
+  const q=norm(UI.qCli||"");
+  const C=clientes().filter(c=>{ if(UI.fCli==="sinadmin"&&c.admin) return false; if(UI.fCli==="sincuenta"&&c.iban) return false; return !q||norm([c.nombre,c.admin,c.nif].join(" ")).includes(q); }).sort((a,b)=>(a.nombre||"").localeCompare(b.nombre||"","es"));
+  if(!C.length) return `<div class="panel empty">${UI.fCli==="sinadmin"&&!q?"Todas las comunidades tienen administrador asignado.":"No hay comunidades con este filtro."}</div>`;
+  return `<p class="sub">${C.length} ${C.length===1?"comunidad":"comunidades"}</p><div class="panel" style="padding:4px 14px"><ul class="list" style="border:0;margin:0">${C.map(c=>`<li class="cli"><div class="nm"><b>${esc(c.nombre)}</b><span>${c.nif?esc(c.nif):"Sin NIF"}${c.iban?" · cuenta …"+esc(ibanLimpio(c.iban).slice(-4))+(c.ibanOk?"":" (sin confirmar)"):" · sin nº de cuenta"}</span></div>${selAdmin(c)}<button class="btn sm ghost" data-act="cliente" data-id="${c.id}">Editar</button></li>`).join("")}</ul></div>`;
+}
 function vCli(){
-  const C=clientes().sort((a,b)=>(a.nombre||"").localeCompare(b.nombre||"","es")); if(!C.length) return '<div class="panel empty">Las comunidades aparecen aquí solas cuando entra su primera factura.</div>';
-  const inc=C.filter(c=>faltas(c).length).length;
-  return `<p class="sub">${C.length} comunidades${inc?" · <b>"+inc+" incompletas</b>":""}</p><div class="panel" style="padding:4px 14px"><ul class="list" style="border:0;margin:0">${C.map(c=>{ const fa=faltas(c); return `<li><div class="nm"><b>${esc(c.nombre)}</b><span>${c.admin?esc(c.admin):"Sin administrador"}${c.iban?" · "+esc(ibanFmt(c.iban).slice(0,9))+"… "+esc(ibanLimpio(c.iban).slice(-4)):""}</span></div>
-    ${fa.length?'<span class="chip warn">'+fa[0]+'</span>':'<span class="chip ok">Completa</span>'}<button class="btn sm ghost" data-act="cliente" data-id="${c.id}">Editar</button></li>`; }).join("")}</ul></div>`;
+  const C=clientes(); if(!C.length) return '<div class="panel empty">Las comunidades aparecen aquí solas cuando entra su primera factura.</div>';
+  const sinA=C.filter(c=>!c.admin).length, sinC=C.filter(c=>!c.iban).length;
+  return `<div class="panel"><h3>El administrador se asigna una vez</h3><p class="sub" style="margin:0">Contasimple no guarda qué administrador lleva cada comunidad, así que se elige aquí. Queda guardado y todas las facturas de esa comunidad, también las futuras, salen ya con él.${sinA?" <b>Faltan "+sinA+" por asignar.</b>":" Están todas asignadas."}</p></div>
+  <div class="filters" style="grid-template-columns:2fr 1.4fr"><input type="search" id="qCli" placeholder="Buscar comunidad, NIF o administrador…" value="${esc(UI.qCli||"")}">
+    <select id="fCli"><option value="todas" ${UI.fCli==="todas"?"selected":""}>Todas (${C.length})</option><option value="sinadmin" ${UI.fCli==="sinadmin"?"selected":""}>Sin administrador (${sinA})</option><option value="sincuenta" ${UI.fCli==="sincuenta"?"selected":""}>Sin nº de cuenta (${sinC})</option></select></div>
+  <div id="listaCli">${listaCliHTML()}</div>`;
+}
+async function asignarAdmin(cid,v){
+  let admin=v; const pares=[];
+  if(v==="__nuevo"){ admin=(prompt("Nombre del nuevo administrador de fincas:","")||"").trim(); if(!admin){ render(); return; }
+    const ex=admins().find(a=>norm(a)===norm(admin)); if(ex) admin=ex; else pares.push(["config",{tipo:"config",admins:[...admins(),admin]}]); }
+  pares.push([cid,{admin}]);
+  await intento(async()=>{ await guardarVarios(pares); if(!UI.demo) render(); aviso(admin?"Guardado: "+admin:"Administrador quitado."); });
 }
 function vAjustes(){
   const c=cfg();
@@ -434,6 +484,8 @@ function vAjustes(){
   <div class="panel"><h3>Limpieza inicial</h3><p class="sub" style="margin:0 0 4px">Da por cobradas de una vez todas las facturas anteriores a una fecha. Las sueltas se marcan con el botón «Ya cobrada» de cada factura.</p>
     <label for="fCorte">Marcar como ya cobradas las anteriores al</label><input type="date" id="fCorte">
     <div class="row" style="margin-top:12px"><button class="btn ghost" data-act="limpieza">Marcar como ya cobradas</button></div></div>
+  <div class="panel"><h3>Copia de seguridad</h3><p class="sub" style="margin:0 0 4px">Descarga un archivo con todas las facturas, comunidades, cuentas y hojas. Hazla una vez al mes y guárdala en la carpeta de DHS. No incluye la clave de Contasimple. ${c.ultimaCopia?"Última copia: "+new Date(c.ultimaCopia).toLocaleDateString("es-ES")+".":"Todavía no se ha hecho ninguna."}</p>
+    <div class="row" style="margin-top:10px"><button class="btn" data-act="copia">Descargar copia</button><label class="btn ghost" style="margin:0;cursor:pointer;color:var(--blue)">Restaurar desde una copia<input type="file" id="fRest" accept=".json,application/json" hidden></label></div></div>
   <div class="panel"><h3>Factura a mano</h3><p class="sub" style="margin:0 0 8px">Para una factura que no venga de Contasimple.</p><button class="btn ghost" data-act="nuevaFactura">Añadir factura</button></div>`;
 }
 
@@ -445,9 +497,10 @@ function render(){
   nav.innerHTML=TABS.map(([k,t])=>`<button data-act="tab" data-v="${k}" aria-current="${UI.tab===k}">${t}${k==="hoja"&&n?"<i>"+n+"</i>":""}</button>`).join("");
   const foco=document.activeElement&&document.activeElement.id;
   if(UI.tab==="pend"&&foco==="q"&&$("#lista")){ $("#lista").innerHTML=listaHTML(); return; }
+  if(UI.tab==="cli"&&foco==="qCli"&&$("#listaCli")){ $("#listaCli").innerHTML=listaCliHTML(); return; }
   if(UI.tab==="aj"&&["csKey","nAdmin","desde","fCorte"].includes(foco)) return;
   const v={pend:vPend,hoja:vHoja,hist:vHist,cli:vCli,aj:vAjustes}[UI.tab]();
-  $("#app").innerHTML=(UI.demo?'<div class="banner">Modo de prueba: datos inventados, nada se guarda.</div>':"")+(!UI.demo&&!cfg().csKey&&UI.tab!=="aj"?'<div class="banner">Falta conectar Contasimple. Hazlo en «Ajustes».</div>':"")+v;
+  $("#app").innerHTML=(UI.demo?'<div class="banner">Modo de prueba: datos inventados, nada se guarda.</div>':"")+(!UI.demo&&!cfg().csKey&&UI.tab!=="aj"?'<div class="banner">Falta conectar Contasimple. Hazlo en «Ajustes».</div>':"")+(()=>{ if(!facturas().length) return ""; const u=cfg().ultimaCopia, d=u?Math.floor((Date.now()-u)/864e5):null; return (d===null||d>=30)?'<div class="banner"><b>Toca hacer la copia de seguridad mensual.</b> '+(d===null?"Todavía no se ha hecho ninguna.":"La última fue hace "+d+" días.")+' <button class="btn sm" data-act="copia" style="margin-left:6px">Descargar copia</button></div>':""; })()+v;
 }
 
 /* ============ Fichas (ventanas) ============ */
@@ -530,6 +583,7 @@ document.addEventListener("click",async ev=>{
     case "enviar": await enviarACobrar(d.id,d.c); break;
     case "yaCobrada": await intento(async()=>{ await setCargo(d.id,d.c,c=>({...c,estado:"cobrado",via:"manual",fechaCobro:hoy()})); aviso("Marcada como ya cobrada. Para deshacerlo, abre la factura."); }); break;
     case "limpieza": await limpieza(); break;
+    case "copia": copiaSeguridad(); break;
     case "quitar": await quitarDeHoja(d.id,d.c); break;
     case "factura": abrirFactura(d.id); break;
     case "cliente": abrirCliente(d.id); break;
@@ -555,8 +609,8 @@ document.addEventListener("click",async ev=>{
     case "guardarManual": await guardarManual(); break;
   }
 });
-document.addEventListener("input",ev=>{ if(ev.target.id==="q"){ UI.q=ev.target.value; $("#lista").innerHTML=listaHTML(); } });
-document.addEventListener("change",ev=>{ if(ev.target.id==="fAdmin"){ UI.fAdmin=ev.target.value; render(); } if(ev.target.id==="fEstado"){ UI.fEstado=ev.target.value; render(); } });
+document.addEventListener("input",ev=>{ if(ev.target.id==="q"){ UI.q=ev.target.value; $("#lista").innerHTML=listaHTML(); } if(ev.target.id==="qCli"){ UI.qCli=ev.target.value; $("#listaCli").innerHTML=listaCliHTML(); } });
+document.addEventListener("change",ev=>{ if(ev.target.classList.contains("selAdmin")){ asignarAdmin(ev.target.dataset.id,ev.target.value); return; } if(ev.target.id==="fCli"){ UI.fCli=ev.target.value; render(); } if(ev.target.id==="fRest"&&ev.target.files[0]){ restaurarCopia(ev.target.files[0]); ev.target.value=""; } if(ev.target.id==="fAdmin"){ UI.fAdmin=ev.target.value; render(); } if(ev.target.id==="fEstado"){ UI.fEstado=ev.target.value; render(); } });
 $("#ov").addEventListener("click",ev=>{ if(ev.target.id==="ov") cerrar(); });
 
 /* ============ Arranque ============ */
